@@ -32,7 +32,7 @@ use tokio_util::sync::PollSender;
 use std::{
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -42,6 +42,15 @@ const MAX_FRAME_SIZE: usize = 16384;
 /// Timeout for waiting on FIN_ACK after sending FIN.
 /// Matches go-libp2p's 5 second stream close timeout.
 const FIN_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Shared state for network-level backpressure between Substream and SubstreamHandle.
+#[derive(Default)]
+struct BackpressureState {
+    /// True when str0m network buffer is above threshold.
+    active: bool,
+    /// Waker to trigger when backpressure clears.
+    waker: Option<Waker>,
+}
 
 /// Substream event.
 #[derive(Debug, PartialEq, Eq)]
@@ -99,6 +108,9 @@ pub struct Substream {
     /// Timeout for waiting on FIN_ACK after sending FIN.
     /// Boxed to maintain Unpin for Substream while allowing the Sleep to be polled.
     fin_ack_timeout: Option<Pin<Box<tokio::time::Sleep>>>,
+
+    /// Shared state for network-level backpressure.
+    backpressure: Arc<Mutex<BackpressureState>>,
 }
 
 impl Substream {
@@ -109,6 +121,7 @@ impl Substream {
         let state = Arc::new(Mutex::new(State::Open));
         let shutdown_waker = Arc::new(AtomicWaker::new());
         let write_waker = Arc::new(AtomicWaker::new());
+        let backpressure = Arc::new(Mutex::new(BackpressureState::default()));
 
         let handle = SubstreamHandle {
             inbound_tx,
@@ -119,6 +132,8 @@ impl Substream {
             write_waker: Arc::clone(&write_waker),
             read_closed: std::sync::atomic::AtomicBool::new(false),
             reset_sent: false,
+            backpressure: Arc::clone(&backpressure),
+            pending_write: None,
         };
 
         (
@@ -130,6 +145,7 @@ impl Substream {
                 shutdown_waker,
                 write_waker,
                 fin_ack_timeout: None,
+                backpressure,
             },
             handle,
         )
@@ -161,6 +177,12 @@ pub struct SubstreamHandle {
 
     /// Whether RESET_STREAM has been sent on abrupt close.
     reset_sent: bool,
+
+    /// Shared state for network-level backpressure.
+    backpressure: Arc<Mutex<BackpressureState>>,
+
+    /// Pending message that couldn't be written due to backpressure.
+    pending_write: Option<Event>,
 }
 
 impl SubstreamHandle {
@@ -259,6 +281,30 @@ impl SubstreamHandle {
         }
 
         Ok(())
+    }
+
+    /// Set backpressure state and wake blocked writers if clearing.
+    pub fn set_backpressure(&mut self, backpressured: bool) {
+        let mut state = self.backpressure.lock();
+        let was_backpressured = state.active;
+        state.active = backpressured;
+
+        // If clearing backpressure, wake any blocked writers
+        if was_backpressured && !backpressured {
+            if let Some(waker) = state.waker.take() {
+                waker.wake();
+            }
+        }
+    }
+
+    /// Store a message that couldn't be written due to backpressure.
+    pub fn queue_pending(&mut self, event: Event) {
+        self.pending_write = Some(event);
+    }
+
+    /// Take any pending message for retry.
+    pub fn take_pending(&mut self) -> Option<Event> {
+        self.pending_write.take()
     }
 }
 
@@ -365,6 +411,15 @@ impl tokio::io::AsyncWrite for Substream {
                 return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
             }
             State::Open => {}
+        }
+
+        // Check network backpressure before internal channel check
+        {
+            let mut state = self.backpressure.lock();
+            if state.active {
+                state.waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
         }
 
         match futures::ready!(self.tx.poll_reserve(cx)) {
@@ -1613,5 +1668,89 @@ mod tests {
             }
             other => panic!("Expected BrokenPipe error, got: {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn network_backpressure_blocks_writes() {
+        let (mut substream, handle) = Substream::new();
+
+        // Simulate network backpressure by setting the flag
+        handle.backpressure.lock().active = true;
+
+        // Write should return Pending
+        futures::future::poll_fn(
+            |cx| match Pin::new(&mut substream).poll_write(cx, &[0u8; 100]) {
+                Poll::Pending => Poll::Ready(()),
+                _ => panic!("expected Pending when backpressured"),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn network_backpressure_wake_on_clear() {
+        use tokio::time::{sleep, timeout, Duration};
+
+        let (mut substream, mut handle) = Substream::new();
+
+        // Set backpressure
+        handle.set_backpressure(true);
+
+        // Spawn write that will block
+        let write_task = tokio::spawn(async move {
+            substream.write_all(&[1u8; 100]).await.unwrap();
+        });
+
+        // Give writer time to block
+        sleep(Duration::from_millis(10)).await;
+        assert!(
+            !write_task.is_finished(),
+            "writer should be blocked by backpressure"
+        );
+
+        // Clear backpressure - should wake writer
+        handle.set_backpressure(false);
+
+        // Writer should complete
+        timeout(Duration::from_secs(1), write_task)
+            .await
+            .expect("write should complete after backpressure cleared")
+            .expect("write task should not panic");
+
+        // Verify the message was sent
+        assert_eq!(
+            handle.next().await,
+            Some(Event::Message {
+                payload: vec![1u8; 100],
+                flag: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_write_queue_and_take() {
+        let (_substream, mut handle) = Substream::new();
+
+        // Initially no pending write
+        assert!(handle.take_pending().is_none());
+
+        // Queue a pending write
+        handle.queue_pending(Event::Message {
+            payload: vec![1, 2, 3],
+            flag: None,
+        });
+
+        // Take the pending write
+        let pending = handle.take_pending();
+        assert_eq!(
+            pending,
+            Some(Event::Message {
+                payload: vec![1, 2, 3],
+                flag: None,
+            })
+        );
+
+        // Should be empty now
+        assert!(handle.take_pending().is_none());
     }
 }
