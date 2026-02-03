@@ -35,7 +35,6 @@ use futures::{future::BoxFuture, Future, Stream};
 use futures_timer::Delay;
 use hickory_resolver::TokioResolver;
 use multiaddr::{multihash::Multihash, Multiaddr, Protocol};
-use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
 use socket2::{Domain, Socket, Type};
 use str0m::{
     channel::{ChannelConfig, ChannelId},
@@ -473,6 +472,24 @@ impl TransportBuilder for WebRtcTransport {
             .generate_certificate()
             .expect("failed to generate DTLS certificate");
 
+        // WebRTC requires specific IP addresses for ICE candidates and cannot bind to 0.0.0.0
+        // unlike TCP/QUIC transports. This is because WebRTC needs to know the exact local IP
+        // for each connection to create valid candidates, but a socket bound to 0.0.0.0 only
+        // reports 0.0.0.0 as its local address (not the actual interface IP packets arrive on).
+        if listen_address.ip().is_unspecified() {
+            tracing::error!(
+                target: LOG_TARGET,
+                ?listen_address,
+                "WebRTC transport cannot bind to unspecified address (0.0.0.0 or ::)",
+            );
+
+            return Err(Error::Other(
+                "WebRTC transport requires a specific IP address and cannot bind to 0.0.0.0 or ::. \
+                 Please configure a specific listen address (e.g., /ip4/127.0.0.1/udp/8888/webrtc-direct)"
+                    .to_string(),
+            ));
+        }
+
         let listen_multi_addresses = {
             let fingerprint = dtls_cert.fingerprint();
 
@@ -480,75 +497,11 @@ impl TransportBuilder for WebRtcTransport {
             let certificate = Multihash::wrap(MULTIHASH_SHA256_CODE, &fingerprint)
                 .expect("fingerprint's len to be 32 bytes");
 
-            // Check if binding to unspecified address (0.0.0.0 or ::)
-            if listen_address.ip().is_unspecified() {
-                let addresses: Vec<Multiaddr> = match NetworkInterface::show() {
-                    Ok(ifaces) => ifaces
-                        .into_iter()
-                        .flat_map(|record| {
-                            record.addr.into_iter().filter_map(|iface_address| {
-                                match (iface_address, listen_address.is_ipv4()) {
-                                    (Addr::V4(inner), true) => Some(
-                                        Multiaddr::empty()
-                                            .with(Protocol::Ip4(inner.ip))
-                                            .with(Protocol::Udp(listen_address.port()))
-                                            .with(Protocol::WebRTC)
-                                            .with(Protocol::Certhash(certificate)),
-                                    ),
-                                    (Addr::V6(inner), false) => {
-                                        // Filter out link-local IPv6 addresses (0xfe80 prefix)
-                                        match inner.ip.segments().first() {
-                                            Some(0xfe80) => None,
-                                            _ => Some(
-                                                Multiaddr::empty()
-                                                    .with(Protocol::Ip6(inner.ip))
-                                                    .with(Protocol::Udp(listen_address.port()))
-                                                    .with(Protocol::WebRTC)
-                                                    .with(Protocol::Certhash(certificate)),
-                                            ),
-                                        }
-                                    }
-                                    _ => None,
-                                }
-                            })
-                        })
-                        .collect(),
-                    Err(error) => {
-                        tracing::warn!(
-                            target: LOG_TARGET,
-                            ?error,
-                            "failed to fetch network interfaces",
-                        );
-
-                        return Err(Error::Other(
-                            "failed to enumerate network interfaces for unspecified address binding"
-                                .to_string(),
-                        ));
-                    }
-                };
-
-                // Ensure we have at least one address after filtering
-                if addresses.is_empty() {
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        "no valid network interfaces found for unspecified address binding",
-                    );
-
-                    return Err(Error::Other(
-                        "no valid network interfaces found for unspecified address binding"
-                            .to_string(),
-                    ));
-                }
-
-                addresses
-            } else {
-                // Specific address binding - return single multiaddr
-                vec![Multiaddr::empty()
-                    .with(Protocol::from(listen_address.ip()))
-                    .with(Protocol::Udp(listen_address.port()))
-                    .with(Protocol::WebRTC)
-                    .with(Protocol::Certhash(certificate))]
-            }
+            vec![Multiaddr::empty()
+                .with(Protocol::from(listen_address.ip()))
+                .with(Protocol::Udp(listen_address.port()))
+                .with(Protocol::WebRTC)
+                .with(Protocol::Certhash(certificate))]
         };
 
         Ok((
