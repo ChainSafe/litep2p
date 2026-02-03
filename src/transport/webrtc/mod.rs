@@ -35,6 +35,7 @@ use futures::{future::BoxFuture, Future, Stream};
 use futures_timer::Delay;
 use hickory_resolver::TokioResolver;
 use multiaddr::{multihash::Multihash, Multiaddr, Protocol};
+use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
 use socket2::{Domain, Socket, Type};
 use str0m::{
     channel::{ChannelConfig, ChannelId},
@@ -471,11 +472,60 @@ impl TransportBuilder for WebRtcTransport {
             let certificate = Multihash::wrap(MULTIHASH_SHA256_CODE, &fingerprint)
                 .expect("fingerprint's len to be 32 bytes");
 
-            vec![Multiaddr::empty()
-                .with(Protocol::from(listen_address.ip()))
-                .with(Protocol::Udp(listen_address.port()))
-                .with(Protocol::WebRTC)
-                .with(Protocol::Certhash(certificate))]
+            // Check if binding to unspecified address (0.0.0.0 or ::)
+            if listen_address.ip().is_unspecified() {
+                match NetworkInterface::show() {
+                    Ok(ifaces) => ifaces
+                        .into_iter()
+                        .flat_map(|record| {
+                            record.addr.into_iter().filter_map(|iface_address| {
+                                match (iface_address, listen_address.is_ipv4()) {
+                                    (Addr::V4(inner), true) => Some(
+                                        Multiaddr::empty()
+                                            .with(Protocol::Ip4(inner.ip))
+                                            .with(Protocol::Udp(listen_address.port()))
+                                            .with(Protocol::WebRTC)
+                                            .with(Protocol::Certhash(certificate)),
+                                    ),
+                                    (Addr::V6(inner), false) => {
+                                        // Filter out link-local IPv6 addresses (0xfe80 prefix)
+                                        match inner.ip.segments().first() {
+                                            Some(0xfe80) => None,
+                                            _ => Some(
+                                                Multiaddr::empty()
+                                                    .with(Protocol::Ip6(inner.ip))
+                                                    .with(Protocol::Udp(listen_address.port()))
+                                                    .with(Protocol::WebRTC)
+                                                    .with(Protocol::Certhash(certificate)),
+                                            ),
+                                        }
+                                    }
+                                    _ => None,
+                                }
+                            })
+                        })
+                        .collect(),
+                    Err(error) => {
+                        tracing::warn!(
+                            target: LOG_TARGET,
+                            ?error,
+                            "failed to fetch network interfaces",
+                        );
+
+                        return Err(Error::Other(
+                            "failed to enumerate network interfaces for unspecified address binding"
+                                .to_string(),
+                        ));
+                    }
+                }
+            } else {
+                // Specific address binding - return single multiaddr
+                vec![Multiaddr::empty()
+                    .with(Protocol::from(listen_address.ip()))
+                    .with(Protocol::Udp(listen_address.port()))
+                    .with(Protocol::WebRTC)
+                    .with(Protocol::Certhash(certificate))]
+            }
         };
 
         Ok((
