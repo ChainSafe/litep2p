@@ -474,7 +474,7 @@ impl TransportBuilder for WebRtcTransport {
 
             // Check if binding to unspecified address (0.0.0.0 or ::)
             if listen_address.ip().is_unspecified() {
-                match NetworkInterface::show() {
+                let addresses: Vec<Multiaddr> = match NetworkInterface::show() {
                     Ok(ifaces) => ifaces
                         .into_iter()
                         .flat_map(|record| {
@@ -517,7 +517,22 @@ impl TransportBuilder for WebRtcTransport {
                                 .to_string(),
                         ));
                     }
+                };
+
+                // Ensure we have at least one address after filtering
+                if addresses.is_empty() {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        "no valid network interfaces found for unspecified address binding",
+                    );
+
+                    return Err(Error::Other(
+                        "no valid network interfaces found for unspecified address binding"
+                            .to_string(),
+                    ));
                 }
+
+                addresses
             } else {
                 // Specific address binding - return single multiaddr
                 vec![Multiaddr::empty()
