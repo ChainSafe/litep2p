@@ -35,6 +35,7 @@ use futures::{future::BoxFuture, Future, Stream};
 use futures_timer::Delay;
 use hickory_resolver::TokioResolver;
 use multiaddr::{multihash::Multihash, Multiaddr, Protocol};
+use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
 use socket2::{Domain, Socket, Type};
 use str0m::{
     channel::{ChannelConfig, ChannelId},
@@ -132,6 +133,9 @@ pub(crate) struct WebRtcTransport {
 
     /// Assigned listen addresss.
     listen_address: SocketAddr,
+
+    /// Candidate address used for WebRTC ICE (may differ from listen_address if bound to 0.0.0.0).
+    candidate_address: SocketAddr,
 
     /// Datagram buffer size.
     datagram_buffer_size: usize,
@@ -400,14 +404,14 @@ impl WebRtcTransport {
 
         // create new `Rtc` object for the peer and give it the received STUN message
         let (mut rtc, noise_channel_id) =
-            self.make_rtc_client(ufrag, pass, source, self.socket.local_addr().unwrap());
+            self.make_rtc_client(ufrag, pass, source, self.candidate_address);
 
         rtc.handle_input(Input::Receive(
             Instant::now(),
             Receive {
                 source,
                 proto: Str0mProtocol::Udp,
-                destination: self.socket.local_addr().unwrap(),
+                destination: self.candidate_address,
                 contents,
             },
         ))
@@ -472,23 +476,61 @@ impl TransportBuilder for WebRtcTransport {
             .generate_certificate()
             .expect("failed to generate DTLS certificate");
 
-        // WebRTC requires specific IP addresses for ICE candidates and cannot bind to 0.0.0.0
-        // unlike TCP/QUIC transports. This is because WebRTC needs to know the exact local IP
-        // for each connection to create valid candidates, but a socket bound to 0.0.0.0 only
-        // reports 0.0.0.0 as its local address (not the actual interface IP packets arrive on).
-        if listen_address.ip().is_unspecified() {
-            tracing::error!(
-                target: LOG_TARGET,
-                ?listen_address,
-                "WebRTC transport cannot bind to unspecified address (0.0.0.0 or ::)",
-            );
+        // When binding to 0.0.0.0, select a suitable interface IP for WebRTC candidates.
+        // WebRTC requires real IP addresses (not 0.0.0.0) for ICE candidates.
+        let candidate_address = if listen_address.ip().is_unspecified() {
+            let interfaces = NetworkInterface::show().map_err(|error| {
+                tracing::warn!(
+                    target: LOG_TARGET,
+                    ?error,
+                    "failed to enumerate network interfaces for 0.0.0.0 binding",
+                );
+                Error::Other("failed to enumerate network interfaces".to_string())
+            })?;
 
-            return Err(Error::Other(
-                "WebRTC transport requires a specific IP address and cannot bind to 0.0.0.0 or ::. \
-                 Please configure a specific listen address (e.g., /ip4/127.0.0.1/udp/8888/webrtc-direct)"
-                    .to_string(),
-            ));
-        }
+            // Try to find a non-loopback interface first
+            let selected_ip = interfaces
+                .iter()
+                .flat_map(|iface| &iface.addr)
+                .find_map(|addr| match (addr, listen_address.is_ipv4()) {
+                    (Addr::V4(v4), true) if !v4.ip.is_loopback() => Some(IpAddr::V4(v4.ip)),
+                    (Addr::V6(v6), false) if !v6.ip.is_loopback() && v6.ip.segments()[0] != 0xfe80 => {
+                        Some(IpAddr::V6(v6.ip))
+                    }
+                    _ => None,
+                })
+                .or_else(|| {
+                    // Fallback to loopback if no non-loopback interface found (for testing/development)
+                    interfaces
+                        .iter()
+                        .flat_map(|iface| &iface.addr)
+                        .find_map(|addr| match (addr, listen_address.is_ipv4()) {
+                            (Addr::V4(v4), true) if v4.ip.is_loopback() => Some(IpAddr::V4(v4.ip)),
+                            (Addr::V6(v6), false) if v6.ip.is_loopback() => Some(IpAddr::V6(v6.ip)),
+                            _ => None,
+                        })
+                })
+                .ok_or_else(|| {
+                    tracing::warn!(
+                        target: LOG_TARGET,
+                        ?listen_address,
+                        "no suitable network interface found for 0.0.0.0 binding",
+                    );
+                    Error::Other(
+                        "no network interface found matching the IP version for WebRTC".to_string(),
+                    )
+                })?;
+
+            let addr = SocketAddr::new(selected_ip, listen_address.port());
+            tracing::info!(
+                target: LOG_TARGET,
+                ?addr,
+                "selected interface IP for WebRTC candidate (socket bound to 0.0.0.0)",
+            );
+            addr
+        } else {
+            listen_address
+        };
 
         let listen_multi_addresses = {
             let fingerprint = dtls_cert.fingerprint();
@@ -498,8 +540,8 @@ impl TransportBuilder for WebRtcTransport {
                 .expect("fingerprint's len to be 32 bytes");
 
             vec![Multiaddr::empty()
-                .with(Protocol::from(listen_address.ip()))
-                .with(Protocol::Udp(listen_address.port()))
+                .with(Protocol::from(candidate_address.ip()))
+                .with(Protocol::Udp(candidate_address.port()))
                 .with(Protocol::WebRTC)
                 .with(Protocol::Certhash(certificate))]
         };
@@ -509,6 +551,7 @@ impl TransportBuilder for WebRtcTransport {
                 context,
                 dtls_cert,
                 listen_address,
+                candidate_address,
                 open: HashMap::new(),
                 opening: HashMap::new(),
                 connections: HashMap::new(),
