@@ -488,19 +488,35 @@ impl TransportBuilder for WebRtcTransport {
                 Error::Other("failed to enumerate network interfaces".to_string())
             })?;
 
-            // Try to find a non-loopback interface first
-            let selected_ip = interfaces
+            // Helper to check if IPv4 is private (RFC 1918)
+            let is_private_v4 = |ip: &std::net::Ipv4Addr| -> bool {
+                ip.is_private() || ip.octets()[0] == 172 && (ip.octets()[1] & 0xf0) == 16
+            };
+
+            // Collect all candidate IPs
+            let candidates: Vec<IpAddr> = interfaces
                 .iter()
                 .flat_map(|iface| &iface.addr)
-                .find_map(|addr| match (addr, listen_address.is_ipv4()) {
+                .filter_map(|addr| match (addr, listen_address.is_ipv4()) {
                     (Addr::V4(v4), true) if !v4.ip.is_loopback() => Some(IpAddr::V4(v4.ip)),
                     (Addr::V6(v6), false) if !v6.ip.is_loopback() && v6.ip.segments()[0] != 0xfe80 => {
                         Some(IpAddr::V6(v6.ip))
                     }
                     _ => None,
                 })
+                .collect();
+
+            // Selection priority: public IPs > private IPs > loopback
+            let selected_ip = candidates
+                .iter()
+                .find(|ip| match ip {
+                    IpAddr::V4(v4) => !is_private_v4(v4),
+                    IpAddr::V6(v6) => !v6.octets().starts_with(&[0xfd]) && !v6.octets().starts_with(&[0xfc]),
+                })
+                .or_else(|| candidates.first())
+                .copied()
                 .or_else(|| {
-                    // Fallback to loopback if no non-loopback interface found (for testing/development)
+                    // Fallback to loopback if no other interface found (for testing/development)
                     interfaces
                         .iter()
                         .flat_map(|iface| &iface.addr)
