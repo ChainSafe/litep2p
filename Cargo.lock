@@ -3505,16 +3505,15 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "str0m"
-version = "0.11.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26890ff5b60e33eb8bedcf44792fc459c8f348ecbf2658edb19477571e547ac2"
+checksum = "edd52622733ae5f6575d37c80d3ef01c022def2a80c8cf20617e873bd3b82fc0"
 dependencies = [
  "combine",
  "crc",
  "fastrand",
  "hmac",
  "libc",
- "once_cell",
  "openssl",
  "openssl-sys",
  "sctp-proto",
