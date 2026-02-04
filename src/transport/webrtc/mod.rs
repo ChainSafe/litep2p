@@ -351,16 +351,16 @@ impl WebRtcTransport {
         let contents: DatagramRecv =
             buffer.as_slice().try_into().map_err(|_| Error::InvalidData)?;
 
-        // Handle non stun packets.
-        if !is_stun_packet(&buffer) {
-            tracing::debug!(
+        // If an opening connection already exists for this source, route all packets to it
+        if let Some(opening_conn) = self.opening.get_mut(&source) {
+            tracing::trace!(
                 target: LOG_TARGET,
                 ?source,
-                "received non-stun message"
+                is_stun = is_stun_packet(&buffer),
+                "routing packet to existing opening connection"
             );
 
-            if let Err(error) = self.opening.get_mut(&source).expect("to exist").on_input(contents)
-            {
+            if let Err(error) = opening_conn.on_input(contents) {
                 tracing::error!(
                     target: LOG_TARGET,
                     ?error,
@@ -369,6 +369,16 @@ impl WebRtcTransport {
                 );
             }
             return Ok(true);
+        }
+
+        // No existing connection - this should be a STUN packet to create a new connection
+        if !is_stun_packet(&buffer) {
+            tracing::warn!(
+                target: LOG_TARGET,
+                ?source,
+                "received non-stun packet without existing connection, ignoring"
+            );
+            return Ok(false);
         }
 
         let stun_message =
