@@ -452,13 +452,13 @@ impl WebRtcConnection {
     ) -> crate::Result<()> {
         let message = WebRtcMessage::decode(&data)?;
 
-        tracing::trace!(
+        tracing::debug!(
             target: LOG_TARGET,
             peer = ?self.peer,
             ?channel_id,
             flag = ?message.flag,
             data_len = message.payload.as_ref().map_or(0usize, |payload| payload.len()),
-            "handle inbound message",
+            "handle inbound message on open channel",
         );
 
         self.handles
@@ -479,6 +479,15 @@ impl WebRtcConnection {
 
     /// Handle data received from a channel.
     async fn on_inbound_data(&mut self, channel_id: ChannelId, data: Vec<u8>) -> crate::Result<()> {
+        tracing::debug!(
+            target: LOG_TARGET,
+            peer = ?self.peer,
+            ?channel_id,
+            data_len = data.len(),
+            channel_state = ?self.channels.get(&channel_id),
+            "received channel data",
+        );
+
         let Some(state) = self.channels.remove(&channel_id) else {
             tracing::warn!(
                 target: LOG_TARGET,
