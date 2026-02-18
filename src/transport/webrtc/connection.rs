@@ -21,7 +21,8 @@
 use crate::{
     error::{Error, ParseError, SubstreamError},
     multistream_select::{
-        webrtc_listener_negotiate, HandshakeResult, ListenerSelectResult, WebRtcDialerState,
+        webrtc_listener_negotiate, HandshakeResult, ListenerSelectResult, NegotiationError,
+        WebRtcDialerState,
     },
     protocol::{Direction, Permit, ProtocolCommand, ProtocolSet},
     substream::Substream,
@@ -396,23 +397,75 @@ impl WebRtcConnection {
             ParseError::InvalidData.into(),
         ))?;
 
-        let HandshakeResult::Succeeded(protocol) = dialer_state.register_response(message)? else {
-            tracing::trace!(
-                target: LOG_TARGET,
-                peer = ?self.peer,
-                ?channel_id,
-                "multistream-select handshake not ready",
-            );
+        let protocol = match dialer_state.register_response(message)? {
+            HandshakeResult::Succeeded(protocol) => protocol,
+            HandshakeResult::NotReady => {
+                tracing::trace!(
+                    target: LOG_TARGET,
+                    peer = ?self.peer,
+                    ?channel_id,
+                    "multistream-select handshake not ready",
+                );
 
-            self.channels.insert(
-                channel_id,
-                ChannelState::OutboundOpening {
-                    context,
-                    dialer_state,
-                },
-            );
+                self.channels.insert(
+                    channel_id,
+                    ChannelState::OutboundOpening {
+                        context,
+                        dialer_state,
+                    },
+                );
 
-            return Ok(None);
+                return Ok(None);
+            }
+            HandshakeResult::Rejected => match dialer_state.propose_next_fallback() {
+                Ok(Some(message)) => {
+                    tracing::trace!(
+                        target: LOG_TARGET,
+                        peer = ?self.peer,
+                        ?channel_id,
+                        "protocol rejected, trying next fallback",
+                    );
+
+                    let message = WebRtcMessage::encode(message, None);
+                    self.rtc
+                        .channel(channel_id)
+                        .ok_or(Error::ChannelDoesntExist)
+                        .map_err(|_| {
+                            SubstreamError::NegotiationError(NegotiationError::Failed.into())
+                        })?
+                        .write(true, message.as_ref())
+                        .map_err(|_| {
+                            SubstreamError::NegotiationError(NegotiationError::Failed.into())
+                        })?;
+
+                    self.channels.insert(
+                        channel_id,
+                        ChannelState::OutboundOpening {
+                            context,
+                            dialer_state,
+                        },
+                    );
+
+                    return Ok(None);
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        target: LOG_TARGET,
+                        peer = ?self.peer,
+                        ?channel_id,
+                        "all protocols rejected by remote peer",
+                    );
+
+                    return Err(SubstreamError::NegotiationError(
+                        NegotiationError::Failed.into(),
+                    ));
+                }
+                Err(_) => {
+                    return Err(SubstreamError::NegotiationError(
+                        NegotiationError::Failed.into(),
+                    ));
+                }
+            },
         };
 
         let ChannelContext {
