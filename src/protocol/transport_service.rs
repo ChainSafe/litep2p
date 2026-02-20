@@ -734,6 +734,7 @@ mod tests {
             Arc::new(AtomicUsize::new(0usize)),
             handle,
             KEEP_ALIVE_TIMEOUT,
+            false,
         );
 
         (service, sender, cmd_rx)
