@@ -71,6 +71,15 @@ pub(crate) struct Connection {
 
     /// Next notification to send, if any.
     next_notification: Option<Vec<u8>>,
+
+    /// Whether the inbound (read) side of the connection has been closed by the remote.
+    ///
+    /// When the remote peer half-closes its write side (e.g., sends FIN on WebRTC), the inbound
+    /// stream will yield `None`. Rather than tearing down the entire connection, we mark the read
+    /// side as closed and continue operating in write-only mode. This is important for notification
+    /// substreams where the remote may have nothing to send (e.g., a light client during warp sync)
+    /// but still needs to receive notifications.
+    read_closed: bool,
 }
 
 /// Notify [`NotificationProtocol`](super::NotificationProtocol) that the connection was closed.
@@ -109,6 +118,7 @@ impl Connection {
                 conn_closed_tx,
                 next_notification: None,
                 notif_tx: PollSender::new(notif_tx),
+                read_closed: false,
             },
             tx,
         )
@@ -188,6 +198,13 @@ pub enum ConnectionEvent {
     },
 }
 
+impl Connection {
+    #[cfg(test)]
+    fn is_read_closed(&self) -> bool {
+        self.read_closed
+    }
+}
+
 impl Stream for Connection {
     type Item = ConnectionEvent;
 
@@ -254,6 +271,12 @@ impl Stream for Connection {
             Poll::Ready(Ok(())) | Poll::Pending => {}
         }
 
+        // If the remote has half-closed the inbound stream (e.g., WebRTC FIN), skip reading.
+        // The connection continues in write-only mode — outbound notifications can still be sent.
+        if this.read_closed {
+            return Poll::Pending;
+        }
+
         if let Err(_) = futures::ready!(this.notif_tx.poll_reserve(cx)) {
             return Poll::Ready(Some(ConnectionEvent::CloseConnection {
                 notify: NotifyProtocol::Yes,
@@ -261,11 +284,210 @@ impl Stream for Connection {
         }
 
         match futures::ready!(this.inbound.poll_next_unpin(cx)) {
-            None | Some(Err(_)) => Poll::Ready(Some(ConnectionEvent::CloseConnection {
-                notify: NotifyProtocol::Yes,
-            })),
+            None | Some(Err(_)) => {
+                tracing::debug!(
+                    target: LOG_TARGET,
+                    peer = ?this.peer,
+                    "inbound stream closed by remote (half-close), continuing in write-only mode",
+                );
+                this.read_closed = true;
+                // Re-register wakers by going through the poll cycle again so we remain
+                // responsive to outbound work and local shutdown signals.
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
             Some(Ok(notification)) =>
                 Poll::Ready(Some(ConnectionEvent::NotificationReceived { notification })),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        mock::substream::MockSubstream,
+        protocol::notification::{handle::NotificationEventHandle, types::InnerNotificationEvent},
+        substream::Substream as GenericSubstream,
+        types::SubstreamId,
+    };
+    use futures::StreamExt;
+    use tokio::sync::mpsc::channel;
+
+    /// Helper to create a `Connection` with mock substreams.
+    ///
+    /// Returns the connection plus channels for driving and observing behavior:
+    /// - `async_tx`: send outbound notifications to the connection
+    /// - `conn_closed_rx`: receives peer ID when connection closes
+    /// - `event_rx`: receives notification events reported to the user
+    /// - `shutdown_tx`: oneshot to signal local-initiated close
+    /// Channels that must be kept alive for the connection to function but aren't
+    /// directly needed by the tests.
+    #[allow(dead_code)]
+    struct ConnectionBackground {
+        sync_tx: Sender<Vec<u8>>,
+        notif_rx: tokio::sync::mpsc::Receiver<(PeerId, BytesMut)>,
+    }
+
+    fn make_connection(
+        inbound: MockSubstream,
+        outbound: MockSubstream,
+    ) -> (
+        Connection,
+        Sender<Vec<u8>>,
+        ConnectionBackground,
+        tokio::sync::mpsc::Receiver<PeerId>,
+        tokio::sync::mpsc::Receiver<InnerNotificationEvent>,
+        oneshot::Sender<()>,
+    ) {
+        let peer = PeerId::random();
+        let (conn_closed_tx, conn_closed_rx) = channel(8);
+        let (notif_tx, notif_rx) = channel(64);
+        let (async_tx, async_rx) = channel(64);
+        let (sync_tx, sync_rx) = channel(64);
+        let (event_tx, event_rx) = channel(64);
+        let event_handle = NotificationEventHandle::new(event_tx);
+
+        let inbound_substream =
+            GenericSubstream::new_mock(peer, SubstreamId::from(0usize), Box::new(inbound));
+        let outbound_substream =
+            GenericSubstream::new_mock(peer, SubstreamId::from(1usize), Box::new(outbound));
+
+        let (conn, shutdown_tx) = Connection::new(
+            peer,
+            inbound_substream,
+            outbound_substream,
+            event_handle,
+            conn_closed_tx,
+            notif_tx,
+            async_rx,
+            sync_rx,
+        );
+
+        let bg = ConnectionBackground { sync_tx, notif_rx };
+        (conn, async_tx, bg, conn_closed_rx, event_rx, shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn half_close_does_not_tear_down_connection() {
+        // Inbound returns None immediately (simulates remote FIN / half-close).
+        let mut inbound = MockSubstream::new();
+        inbound
+            .expect_poll_next()
+            .returning(|_| Poll::Ready(None));
+
+        // Outbound accepts writes and flushes successfully.
+        let mut outbound = MockSubstream::new();
+        outbound
+            .expect_poll_ready()
+            .returning(|_| Poll::Ready(Ok(())));
+        outbound
+            .expect_start_send()
+            .returning(|_| Ok(()));
+        outbound
+            .expect_poll_flush()
+            .returning(|_| Poll::Ready(Ok(())));
+
+        let (mut conn, async_tx, _bg, mut conn_closed_rx, _event_rx, _shutdown_tx) =
+            make_connection(inbound, outbound);
+
+        // Verify read_closed was set by polling once.
+        futures::future::poll_fn(|cx| {
+            // This first poll should process the inbound None and set read_closed.
+            match conn.poll_next_unpin(cx) {
+                Poll::Pending => {
+                    assert!(conn.is_read_closed(), "read_closed should be set after inbound returns None");
+                    Poll::Ready(())
+                }
+                Poll::Ready(Some(ConnectionEvent::CloseConnection { .. })) => {
+                    panic!("Connection should NOT close on remote half-close");
+                }
+                Poll::Ready(other) => {
+                    panic!("Unexpected event: {:?}", other.is_some());
+                }
+            }
+        })
+        .await;
+
+        // Verify the connection was NOT reported as closed.
+        assert!(
+            conn_closed_rx.try_recv().is_err(),
+            "Connection should not be reported as closed"
+        );
+
+        // Now send an outbound notification — the write side should still work.
+        async_tx.send(vec![1, 2, 3]).await.unwrap();
+
+        // Poll the connection again — it should process the outbound notification
+        // without trying to read from inbound.
+        futures::future::poll_fn(|cx| {
+            match conn.poll_next_unpin(cx) {
+                Poll::Pending => Poll::Ready(()),
+                Poll::Ready(Some(ConnectionEvent::CloseConnection { .. })) => {
+                    panic!("Connection should NOT close after sending outbound notification");
+                }
+                _ => Poll::Ready(()),
+            }
+        })
+        .await;
+
+        // Verify the connection is still alive (no close notification sent).
+        assert!(
+            conn_closed_rx.try_recv().is_err(),
+            "Connection should still be alive after outbound notification"
+        );
+    }
+
+    #[tokio::test]
+    async fn half_close_connection_closes_on_local_shutdown() {
+        // Inbound returns None immediately (simulates remote FIN / half-close).
+        let mut inbound = MockSubstream::new();
+        inbound
+            .expect_poll_next()
+            .returning(|_| Poll::Ready(None));
+
+        // Outbound accepts writes.
+        let mut outbound = MockSubstream::new();
+        outbound
+            .expect_poll_ready()
+            .returning(|_| Poll::Pending);
+        outbound
+            .expect_poll_flush()
+            .returning(|_| Poll::Ready(Ok(())));
+        outbound
+            .expect_poll_close()
+            .returning(|_| Poll::Ready(Ok(())));
+
+        let (mut conn, _async_tx, _bg, _conn_closed_rx, _event_rx, shutdown_tx) =
+            make_connection(inbound, outbound);
+
+        // First, let read_closed get set.
+        futures::future::poll_fn(|cx| {
+            let _ = conn.poll_next_unpin(cx);
+            if conn.is_read_closed() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+
+        assert!(conn.is_read_closed());
+
+        // Now trigger local shutdown.
+        shutdown_tx.send(()).unwrap();
+
+        // The connection should emit CloseConnection with NotifyProtocol::No.
+        let event = futures::future::poll_fn(|cx| conn.poll_next_unpin(cx)).await;
+
+        assert!(
+            matches!(
+                event,
+                Some(ConnectionEvent::CloseConnection {
+                    notify: NotifyProtocol::No
+                })
+            ),
+            "Local shutdown should close connection with NotifyProtocol::No"
+        );
     }
 }
