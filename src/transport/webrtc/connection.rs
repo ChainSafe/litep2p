@@ -71,7 +71,9 @@ struct ChannelContext {
     /// Substream ID.
     substream_id: SubstreamId,
 
-    /// Permit which keeps the connection open.
+    /// Permit which keeps the connection open while we are opening a substream. Must be returned
+    /// to [`TransportService`](crate::protocol::TransportService), where it can be safely dropped
+    /// after upgrading the connection.
     permit: Permit,
 }
 
@@ -161,9 +163,6 @@ enum ChannelState {
 
         /// Channel ID.
         channel_id: ChannelId,
-
-        /// Connection permit.
-        permit: Permit,
     },
 }
 
@@ -318,7 +317,7 @@ impl WebRtcConnection {
         &mut self,
         channel_id: ChannelId,
         data: Vec<u8>,
-    ) -> crate::Result<Option<(SubstreamId, SubstreamHandle, Permit)>> {
+    ) -> crate::Result<Option<(SubstreamId, SubstreamHandle)>> {
         tracing::trace!(
             target: LOG_TARGET,
             peer = ?self.peer,
@@ -370,9 +369,15 @@ impl WebRtcConnection {
         );
 
         self.protocol_set
-            .report_substream_open(self.peer, protocol.clone(), Direction::Inbound, substream)
+            .report_substream_open(
+                self.peer,
+                protocol.clone(),
+                Direction::Inbound,
+                substream,
+                permit,
+            )
             .await
-            .map(|_| Some((substream_id, handle, permit)))
+            .map(|_| Some((substream_id, handle)))
             .map_err(Into::into)
     }
 
@@ -397,7 +402,7 @@ impl WebRtcConnection {
         data: Vec<u8>,
         mut dialer_state: WebRtcDialerState,
         context: ChannelContext,
-    ) -> Result<Option<(SubstreamId, SubstreamHandle, Permit)>, SubstreamError> {
+    ) -> Result<Option<(SubstreamId, SubstreamHandle)>, SubstreamError> {
         tracing::trace!(
             target: LOG_TARGET,
             peer = ?self.peer,
@@ -507,9 +512,10 @@ impl WebRtcConnection {
                 protocol.clone(),
                 Direction::Outbound(substream_id),
                 substream,
+                permit,
             )
             .await
-            .map(|_| Some((substream_id, handle, permit)))
+            .map(|_| Some((substream_id, handle)))
     }
 
     /// Handle data received from an open channel.
@@ -570,14 +576,13 @@ impl WebRtcConnection {
         match state {
             ChannelState::InboundOpening => {
                 match self.on_inbound_opening_channel_data(channel_id, data).await {
-                    Ok(Some((substream_id, handle, permit))) => {
+                    Ok(Some((substream_id, handle))) => {
                         self.handles.insert(channel_id, handle);
                         self.channels.insert(
                             channel_id,
                             ChannelState::Open {
                                 substream_id,
                                 channel_id,
-                                permit,
                             },
                         );
                     }
@@ -612,14 +617,13 @@ impl WebRtcConnection {
                     .on_outbound_opening_channel_data(channel_id, data, dialer_state, context)
                     .await
                 {
-                    Ok(Some((substream_id, handle, permit))) => {
+                    Ok(Some((substream_id, handle))) => {
                         self.handles.insert(channel_id, handle);
                         self.channels.insert(
                             channel_id,
                             ChannelState::Open {
                                 substream_id,
                                 channel_id,
-                                permit,
                             },
                         );
                     }
@@ -646,7 +650,6 @@ impl WebRtcConnection {
             ChannelState::Open {
                 substream_id,
                 channel_id,
-                permit,
             } => match self.on_open_channel_data(channel_id, data).await {
                 Ok(()) => {
                     self.channels.insert(
@@ -654,7 +657,6 @@ impl WebRtcConnection {
                         ChannelState::Open {
                             substream_id,
                             channel_id,
-                            permit,
                         },
                     );
                 }

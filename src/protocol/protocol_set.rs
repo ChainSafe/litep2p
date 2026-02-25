@@ -127,6 +127,10 @@ pub enum InnerTransportEvent {
 
         /// Substream.
         substream: Substream,
+
+        /// Permit that was held while this substream was opening. Must be dropped by
+        /// [`TransportService`](crate::protocol::TransportService) once connection is upgraded.
+        permit: Permit,
     },
 
     /// Failed to open substream.
@@ -284,6 +288,7 @@ impl ProtocolSet {
         protocol: ProtocolName,
         direction: Direction,
         substream: Substream,
+        permit: Permit,
     ) -> Result<(), SubstreamError> {
         tracing::debug!(target: LOG_TARGET, %protocol, ?peer, ?direction, "substream opened");
 
@@ -308,6 +313,7 @@ impl ProtocolSet {
             direction,
             substream,
             connection_id: *self.connection.connection_id(),
+            permit,
         };
 
         protocol_context
@@ -492,6 +498,7 @@ mod tests {
             assert!(expected_protocols.contains(protocol));
         }
 
+        let permit = protocol_set.try_get_permit().unwrap();
         protocol_set
             .report_substream_open(
                 PeerId::random(),
@@ -502,6 +509,7 @@ mod tests {
                     SubstreamId::from(0usize),
                     Box::new(MockSubstream::new()),
                 ),
+                permit,
             )
             .await
             .unwrap();
@@ -529,6 +537,7 @@ mod tests {
             )]),
         );
 
+        let permit = protocol_set.try_get_permit().unwrap();
         protocol_set
             .report_substream_open(
                 PeerId::random(),
@@ -539,6 +548,7 @@ mod tests {
                     SubstreamId::from(0usize),
                     Box::new(MockSubstream::new()),
                 ),
+                permit,
             )
             .await
             .unwrap();
@@ -576,6 +586,7 @@ mod tests {
             )]),
         );
 
+        let permit = protocol_set.try_get_permit().unwrap();
         protocol_set
             .report_substream_open(
                 PeerId::random(),
@@ -586,6 +597,7 @@ mod tests {
                     SubstreamId::from(0usize),
                     Box::new(MockSubstream::new()),
                 ),
+                permit,
             )
             .await
             .unwrap();
