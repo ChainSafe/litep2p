@@ -293,8 +293,49 @@ impl WebRtcConnection {
             "channel closed",
         );
 
-        self.pending_outbound.remove(&channel_id);
-        self.channels.remove(&channel_id);
+        // If this was a pending outbound channel (waiting for DCEP ACK from remote),
+        // report the failure so the protocol handler can retry.
+        if let Some(context) = self.pending_outbound.remove(&channel_id) {
+            tracing::debug!(
+                target: LOG_TARGET,
+                peer = ?self.peer,
+                ?channel_id,
+                protocol = %context.protocol,
+                substream_id = ?context.substream_id,
+                "outbound channel closed before opening, reporting failure",
+            );
+
+            let _ = self
+                .protocol_set
+                .report_substream_open_failure(
+                    context.protocol,
+                    context.substream_id,
+                    SubstreamError::ConnectionClosed,
+                )
+                .await;
+        } else if let Some(channel_state) = self.channels.remove(&channel_id) {
+            // Channel was in multistream-select negotiation when it closed.
+            if let ChannelState::OutboundOpening { context, .. } = channel_state {
+                tracing::debug!(
+                    target: LOG_TARGET,
+                    peer = ?self.peer,
+                    ?channel_id,
+                    protocol = %context.protocol,
+                    substream_id = ?context.substream_id,
+                    "outbound channel closed during negotiation, reporting failure",
+                );
+
+                let _ = self
+                    .protocol_set
+                    .report_substream_open_failure(
+                        context.protocol,
+                        context.substream_id,
+                        SubstreamError::ConnectionClosed,
+                    )
+                    .await;
+            }
+        }
+
         self.handles.remove(&channel_id);
 
         Ok(())
