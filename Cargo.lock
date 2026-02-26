@@ -632,7 +632,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ab67060fc6b8ef687992d439ca0fa36e7ed17e9a0b16b25b601e8757df720de"
 dependencies = [
  "data-encoding",
- "syn 2.0.114",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -3505,7 +3505,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "str0m"
 version = "0.13.0"
-source = "git+https://github.com/ChainSafe/str0m?rev=0acd365d7eecc16b7ef836684168de2bf8ee48f5#0acd365d7eecc16b7ef836684168de2bf8ee48f5"
+source = "git+https://github.com/ChainSafe/str0m?rev=158e882948e1a582f1ba375bd06a7fca1b20fae5#158e882948e1a582f1ba375bd06a7fca1b20fae5"
 dependencies = [
  "combine",
  "crc",
