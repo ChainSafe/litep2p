@@ -65,7 +65,7 @@ rcgen = { version = "0.14.5", optional = true }
 # End of Quic related dependencies.
 
 # WebRTC related dependencies. WebRTC is an experimental feature flag. The dependencies must be updated.
-str0m = { git = "https://github.com/ChainSafe/str0m", rev = "bb2401c6e8b0ade1599bb546efc5efd0ec97ef30", optional = true }
+str0m = { git = "https://github.com/ChainSafe/str0m", rev = "f3fda0f9b841da79a6973d07a57e69d77b414d16", optional = true }
 # End of WebRTC related dependencies.
 
 # Fuzzing related dependencies.
