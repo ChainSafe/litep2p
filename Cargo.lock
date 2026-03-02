@@ -3505,7 +3505,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "str0m"
 version = "0.13.0"
-source = "git+https://github.com/ChainSafe/str0m?rev=21df80960afa5f23d7fbccba332ef1b3a9429867#21df80960afa5f23d7fbccba332ef1b3a9429867"
+source = "git+https://github.com/ChainSafe/str0m?rev=2f3a70ed6094ee8e6ae8b186911f6bb850ed4acd#2f3a70ed6094ee8e6ae8b186911f6bb850ed4acd"
 dependencies = [
  "combine",
  "crc",
