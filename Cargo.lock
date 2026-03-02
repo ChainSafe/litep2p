@@ -3203,7 +3203,7 @@ dependencies = [
 [[package]]
 name = "sctp-proto"
 version = "0.5.0"
-source = "git+https://github.com/ChainSafe/sctp-proto.git?rev=7100453256d768a5ef0df2ab1e84d791b00bd1e8#7100453256d768a5ef0df2ab1e84d791b00bd1e8"
+source = "git+https://github.com/ChainSafe/sctp-proto.git?rev=63a08b57c41cd530bb9e9e6e4fca6778d4d6889e#63a08b57c41cd530bb9e9e6e4fca6778d4d6889e"
 dependencies = [
  "bytes",
  "crc",
@@ -3505,7 +3505,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "str0m"
 version = "0.13.0"
-source = "git+https://github.com/ChainSafe/str0m?rev=262d41b88ec27a8eadb566ced84e2c00bdca8256#262d41b88ec27a8eadb566ced84e2c00bdca8256"
+source = "git+https://github.com/ChainSafe/str0m?rev=21df80960afa5f23d7fbccba332ef1b3a9429867#21df80960afa5f23d7fbccba332ef1b3a9429867"
 dependencies = [
  "combine",
  "crc",
