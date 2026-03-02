@@ -24,7 +24,7 @@ use crate::{
         webrtc_listener_negotiate, HandshakeResult, ListenerSelectResult, NegotiationError,
         WebRtcDialerState,
     },
-    protocol::{Direction, Permit, ProtocolCommand, ProtocolSet},
+    protocol::{Direction, Permit, ProtocolCommand, ProtocolSet, SubstreamKeepAlive},
     substream::Substream,
     transport::{
         webrtc::{
@@ -59,7 +59,7 @@ use std::{
 /// Logging target for the file.
 const LOG_TARGET: &str = "litep2p::webrtc::connection";
 
-/// Channel context.
+/// Opening channel context.
 #[derive(Debug)]
 struct ChannelContext {
     /// Protocol name.
@@ -74,7 +74,11 @@ struct ChannelContext {
     /// Permit which keeps the connection open while we are opening a substream. Must be returned
     /// to [`TransportService`](crate::protocol::TransportService), where it can be safely dropped
     /// after upgrading the connection.
-    permit: Permit,
+    opening_permit: Permit,
+
+    /// Whether this substream should keep the connection alive while it exists, i.e., whether it
+    /// should store the permit entioned above for the lifetime of the substream.
+    keep_alive: SubstreamKeepAlive,
 }
 
 /// Set of [`SubstreamHandle`]s.
@@ -163,6 +167,9 @@ enum ChannelState {
 
         /// Channel ID.
         channel_id: ChannelId,
+
+        /// Connection permit if this substream needs to keep connection open.
+        lifetime_permit: Option<Permit>,
     },
 }
 
@@ -317,7 +324,7 @@ impl WebRtcConnection {
         &mut self,
         channel_id: ChannelId,
         data: Vec<u8>,
-    ) -> crate::Result<Option<(SubstreamId, SubstreamHandle)>> {
+    ) -> crate::Result<Option<(SubstreamId, SubstreamHandle, Option<Permit>)>> {
         tracing::trace!(
             target: LOG_TARGET,
             peer = ?self.peer,
@@ -326,13 +333,13 @@ impl WebRtcConnection {
         );
 
         let payload = WebRtcMessage::decode(&data)?.payload.ok_or(Error::InvalidData)?;
-        let (response, negotiated) = match webrtc_listener_negotiate(
-            &mut self.protocol_set.protocols().iter(),
-            payload.into(),
-        )? {
-            ListenerSelectResult::Accepted { protocol, message } => (message, Some(protocol)),
-            ListenerSelectResult::Rejected { message } => (message, None),
-        };
+        let protocols = self.protocol_set.protocols_with_keep_alives();
+        let protocol_names = protocols.keys().cloned().collect();
+        let (response, negotiated) =
+            match webrtc_listener_negotiate(protocol_names, payload.into())? {
+                ListenerSelectResult::Accepted { protocol, message } => (message, Some(protocol)),
+                ListenerSelectResult::Rejected { message } => (message, None),
+            };
 
         self.rtc
             .channel(channel_id)
@@ -355,9 +362,12 @@ impl WebRtcConnection {
 
         let substream_id = self.protocol_set.next_substream_id();
         let codec = self.protocol_set.protocol_codec(&protocol);
-        let permit = self.protocol_set.try_get_permit().ok_or(Error::ConnectionClosed)?;
+        let opening_permit = self.protocol_set.try_get_permit().ok_or(Error::ConnectionClosed)?;
         let (substream, handle) = WebRtcSubstream::new();
         let substream = Substream::new_webrtc(self.peer, substream_id, substream, codec);
+        let keep_alive =
+            protocols.get(&protocol).expect("negotiated protocol to be one of the keys");
+        let lifetime_permit = keep_alive.then(|| opening_permit.clone());
 
         tracing::trace!(
             target: LOG_TARGET,
@@ -374,10 +384,10 @@ impl WebRtcConnection {
                 protocol.clone(),
                 Direction::Inbound,
                 substream,
-                permit,
+                opening_permit,
             )
             .await
-            .map(|_| Some((substream_id, handle)))
+            .map(|_| Some((substream_id, handle, lifetime_permit)))
             .map_err(Into::into)
     }
 
@@ -490,7 +500,7 @@ impl WebRtcConnection {
 
         let ChannelContext {
             substream_id,
-            permit,
+            opening_permit,
             ..
         } = context;
         let codec = self.protocol_set.protocol_codec(&protocol);
@@ -512,7 +522,7 @@ impl WebRtcConnection {
                 protocol.clone(),
                 Direction::Outbound(substream_id),
                 substream,
-                permit,
+                opening_permit,
             )
             .await
             .map(|_| Some((substream_id, handle)))
@@ -576,13 +586,14 @@ impl WebRtcConnection {
         match state {
             ChannelState::InboundOpening => {
                 match self.on_inbound_opening_channel_data(channel_id, data).await {
-                    Ok(Some((substream_id, handle))) => {
+                    Ok(Some((substream_id, handle, lifetime_permit))) => {
                         self.handles.insert(channel_id, handle);
                         self.channels.insert(
                             channel_id,
                             ChannelState::Open {
                                 substream_id,
                                 channel_id,
+                                lifetime_permit,
                             },
                         );
                     }
@@ -612,6 +623,7 @@ impl WebRtcConnection {
             } => {
                 let protocol = context.protocol.clone();
                 let substream_id = context.substream_id;
+                let lifetime_permit = context.keep_alive.then(|| context.opening_permit.clone());
 
                 match self
                     .on_outbound_opening_channel_data(channel_id, data, dialer_state, context)
@@ -624,6 +636,7 @@ impl WebRtcConnection {
                             ChannelState::Open {
                                 substream_id,
                                 channel_id,
+                                lifetime_permit,
                             },
                         );
                     }
@@ -650,6 +663,7 @@ impl WebRtcConnection {
             ChannelState::Open {
                 substream_id,
                 channel_id,
+                lifetime_permit,
             } => match self.on_open_channel_data(channel_id, data).await {
                 Ok(()) => {
                     self.channels.insert(
@@ -657,6 +671,7 @@ impl WebRtcConnection {
                         ChannelState::Open {
                             substream_id,
                             channel_id,
+                            lifetime_permit,
                         },
                     );
                 }
@@ -717,7 +732,8 @@ impl WebRtcConnection {
         protocol: ProtocolName,
         fallback_names: Vec<ProtocolName>,
         substream_id: SubstreamId,
-        permit: Permit,
+        opening_permit: Permit,
+        keep_alive: SubstreamKeepAlive,
     ) {
         let channel_id = self.rtc.direct_api().create_data_channel(ChannelConfig {
             label: "".to_string(),
@@ -743,7 +759,8 @@ impl WebRtcConnection {
                 protocol,
                 fallback_names,
                 substream_id,
-                permit,
+                opening_permit,
+                keep_alive,
             },
         );
     }
@@ -762,19 +779,8 @@ impl WebRtcConnection {
             .await;
     }
 
-    /// Start running event loop of [`WebRtcConnection`].
-    pub async fn run(mut self) {
-        tracing::trace!(
-            target: LOG_TARGET,
-            peer = ?self.peer,
-            "start webrtc connection event loop",
-        );
-
-        let _ = self
-            .protocol_set
-            .report_connection_established(self.peer, self.endpoint.clone())
-            .await;
-
+    /// Start the connection event loop without notifying protocols.
+    pub async fn run_event_loop(mut self) {
         loop {
             // poll output until we get a timeout
             let output = match self.rtc.poll_output() {
@@ -930,22 +936,21 @@ impl WebRtcConnection {
                         );
                         return self.on_connection_closed().await;
                     }
-                    Some(ProtocolCommand::OpenSubstream { protocol, fallback_names, substream_id, permit, .. }) => {
-                        // Check if the connection is still healthy before opening new substreams.
-                        // This prevents panics when trying to open channels on a shutting-down
-                        // SCTP association.
-                        if !self.rtc.is_alive() || !self.rtc.is_connected() {
-                            tracing::debug!(
-                                target: LOG_TARGET,
-                                peer = ?self.peer,
-                                ?protocol,
-                                is_alive = self.rtc.is_alive(),
-                                is_connected = self.rtc.is_connected(),
-                                "rejecting substream open: connection not healthy",
-                            );
-                            continue;
-                        }
-                        self.on_open_substream(protocol, fallback_names, substream_id, permit);
+                    Some(ProtocolCommand::OpenSubstream {
+                        protocol,
+                        fallback_names,
+                        substream_id,
+                        permit,
+                        keep_alive,
+                        connection_id: _,
+                    }) => {
+                        self.on_open_substream(
+                            protocol,
+                            fallback_names,
+                            substream_id,
+                            permit,
+                            keep_alive,
+                        );
                     }
                 },
                 _ = tokio::time::sleep(duration) => {

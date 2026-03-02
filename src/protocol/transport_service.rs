@@ -269,6 +269,14 @@ pub enum SubstreamKeepAlive {
     No,
 }
 
+impl SubstreamKeepAlive {
+    /// Shortcut to `(self == SubstreamKeepAlive::Yes).then()`.
+    #[inline]
+    pub fn then<T, F: FnOnce() -> T>(&self, f: F) -> Option<T> {
+        (*self == SubstreamKeepAlive::Yes).then(f)
+    }
+}
+
 /// Provides an interfaces for [`Litep2p`](crate::Litep2p) protocols to interact
 /// with the underlying transport protocols.
 #[derive(Debug)]
@@ -297,6 +305,7 @@ pub struct TransportService {
     /// Close the connection if no substreams are open within this time frame.
     keep_alive_tracker: KeepAliveTracker,
 
+    /// Whether this protocol susbstreams should keep connection alive.
     substream_keep_alive: SubstreamKeepAlive,
 }
 
@@ -588,6 +597,7 @@ impl TransportService {
                 self.fallback_names.clone(),
                 substream_id,
                 permit,
+                self.substream_keep_alive,
             )
             .map(|_| substream_id)
     }
@@ -667,7 +677,7 @@ impl Stream for TransportService {
                     direction,
                     substream,
                     connection_id,
-                    permit,
+                    opening_permit,
                 }) => {
                     if protocol == self.protocol
                         && self.substream_keep_alive == SubstreamKeepAlive::Yes
@@ -680,7 +690,7 @@ impl Stream for TransportService {
 
                     // Connection is upgraded, we must now drop the permit.
                     // This is for the reader, not for compiler.
-                    drop(permit);
+                    drop(opening_permit);
 
                     return Poll::Ready(Some(TransportEvent::SubstreamOpened {
                         peer,
