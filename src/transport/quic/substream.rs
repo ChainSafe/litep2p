@@ -35,10 +35,7 @@ use std::{
 /// QUIC substream.
 #[derive(Debug)]
 pub struct Substream {
-<<<<<<< HEAD
-=======
     _lifetime_permit: Option<Permit>,
->>>>>>> master
     bandwidth_sink: BandwidthSink,
     send_stream: SendStream,
     recv_stream: RecvStream,
@@ -47,19 +44,13 @@ pub struct Substream {
 impl Substream {
     /// Create new [`Substream`].
     pub fn new(
-<<<<<<< HEAD
-=======
         _lifetime_permit: Option<Permit>,
->>>>>>> master
         send_stream: SendStream,
         recv_stream: RecvStream,
         bandwidth_sink: BandwidthSink,
     ) -> Self {
         Self {
-<<<<<<< HEAD
-=======
             _lifetime_permit,
->>>>>>> master
             send_stream,
             recv_stream,
             bandwidth_sink,
