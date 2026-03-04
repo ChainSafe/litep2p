@@ -38,10 +38,10 @@ use multiaddr::{multihash::Multihash, Multiaddr, Protocol};
 use socket2::{Domain, Socket, Type};
 use str0m::{
     channel::{ChannelConfig, ChannelId},
-    config::{CryptoProvider, DtlsCert, DtlsCertOptions},
+    config::DtlsCert,
     ice::IceCreds,
     net::{DatagramRecv, Protocol as Str0mProtocol, Receive},
-    Candidate, DtlsCertConfig, Input, Rtc,
+    Candidate, Input, Rtc,
 };
 
 use tokio::{
@@ -225,9 +225,9 @@ impl WebRtcTransport {
     ) -> (Rtc, ChannelId) {
         let mut rtc = Rtc::builder()
             .set_ice_lite(true)
-            .set_dtls_cert_config(DtlsCertConfig::PregeneratedCert(self.dtls_cert.clone()))
+            .set_dtls_cert(self.dtls_cert.clone())
             .set_fingerprint_verification(false)
-            .build();
+            .build(std::time::Instant::now());
         rtc.add_local_candidate(Candidate::host(destination, Str0mProtocol::Udp).unwrap());
         rtc.add_remote_candidate(Candidate::host(source, Str0mProtocol::Udp).unwrap());
         rtc.direct_api()
@@ -363,35 +363,34 @@ impl WebRtcTransport {
         let contents: DatagramRecv =
             buffer.as_slice().try_into().map_err(|_| Error::InvalidData)?;
 
-        // Handle non stun packets.
-        if !is_stun_packet(&buffer) {
-            tracing::debug!(
+        // If an opening connection already exists for this source, route all packets to it
+        if let Some(opening_conn) = self.opening.get_mut(&source) {
+            tracing::trace!(
                 target: LOG_TARGET,
                 ?source,
-                "received non-stun message"
+                is_stun = is_stun_packet(&buffer),
+                "routing packet to existing opening connection"
             );
 
-            match self.opening.get_mut(&source) {
-                Some(connection) =>
-                    if let Err(error) = connection.on_input(contents) {
-                        tracing::error!(
-                            target: LOG_TARGET,
-                            ?error,
-                            ?source,
-                            "failed to handle inbound datagram"
-                        );
-                    },
-                None => {
-                    tracing::warn!(
-                        target: LOG_TARGET,
-                        ?source,
-                        "received non-stun message from unknown peer",
-                    );
-                    return Err(Error::InvalidData);
-                }
-            };
-
+            if let Err(error) = opening_conn.on_input(contents) {
+                tracing::error!(
+                    target: LOG_TARGET,
+                    ?error,
+                    ?source,
+                    "failed to handle inbound datagram"
+                );
+            }
             return Ok(true);
+        }
+
+        // No existing connection - this should be a STUN packet to create a new connection
+        if !is_stun_packet(&buffer) {
+            tracing::warn!(
+                target: LOG_TARGET,
+                ?source,
+                "received non-stun packet without existing connection, ignoring"
+            );
+            return Ok(false);
         }
 
         let stun_message =
@@ -482,10 +481,14 @@ impl TransportBuilder for WebRtcTransport {
 
         let socket = UdpSocket::from_std(socket.into())?;
         let listen_address = socket.local_addr()?;
-        let dtls_cert = DtlsCert::new(CryptoProvider::OpenSsl, DtlsCertOptions::default());
+        let crypto_provider = str0m::crypto::from_feature_flags();
+        let dtls_cert = crypto_provider
+            .dtls_provider
+            .generate_certificate()
+            .expect("DTLS certificate generation failed");
 
         let listen_multi_addresses = {
-            let fingerprint = dtls_cert.fingerprint().bytes;
+            let fingerprint = dtls_cert.fingerprint();
 
             const MULTIHASH_SHA256_CODE: u64 = 0x12;
             let certificate = Multihash::wrap(MULTIHASH_SHA256_CODE, &fingerprint)
