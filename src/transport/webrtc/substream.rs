@@ -32,7 +32,7 @@ use tokio_util::sync::PollSender;
 use std::{
     pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -42,6 +42,15 @@ const MAX_FRAME_SIZE: usize = 16384;
 /// Timeout for waiting on FIN_ACK after sending FIN.
 /// Matches go-libp2p's 5 second stream close timeout.
 const FIN_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Shared state for network-level backpressure between Substream and SubstreamHandle.
+#[derive(Default)]
+struct BackpressureState {
+    /// True when str0m network buffer is above threshold.
+    active: bool,
+    /// Waker to trigger when backpressure clears.
+    waker: Option<Waker>,
+}
 
 /// Substream event.
 #[derive(Debug, PartialEq, Eq)]
@@ -99,6 +108,9 @@ pub struct Substream {
     /// Timeout for waiting on FIN_ACK after sending FIN.
     /// Boxed to maintain Unpin for Substream while allowing the Sleep to be polled.
     fin_ack_timeout: Option<Pin<Box<tokio::time::Sleep>>>,
+
+    /// Shared state for network-level backpressure.
+    backpressure: Arc<Mutex<BackpressureState>>,
 }
 
 impl Substream {
@@ -109,6 +121,7 @@ impl Substream {
         let state = Arc::new(Mutex::new(State::Open));
         let shutdown_waker = Arc::new(AtomicWaker::new());
         let write_waker = Arc::new(AtomicWaker::new());
+        let backpressure = Arc::new(Mutex::new(BackpressureState::default()));
 
         let handle = SubstreamHandle {
             inbound_tx,
@@ -118,6 +131,10 @@ impl Substream {
             shutdown_waker: Arc::clone(&shutdown_waker),
             write_waker: Arc::clone(&write_waker),
             read_closed: std::sync::atomic::AtomicBool::new(false),
+            fin_delivered: std::sync::atomic::AtomicBool::new(false),
+            sent_reset: false,
+            backpressure: Arc::clone(&backpressure),
+            pending_write: None,
         };
 
         (
@@ -129,6 +146,7 @@ impl Substream {
                 shutdown_waker,
                 write_waker,
                 fin_ack_timeout: None,
+                backpressure,
             },
             handle,
         )
@@ -157,6 +175,21 @@ pub struct SubstreamHandle {
     /// Whether we've already sent RecvClosed to the inbound channel.
     /// Prevents duplicate RecvClosed events if multiple FIN messages are received.
     read_closed: std::sync::atomic::AtomicBool,
+
+    /// Whether the remote's FIN was successfully delivered to the Substream.
+    /// When true, the Substream acknowledged the close, so dropping without
+    /// explicit shutdown is a clean close (no ResetStream needed).
+    /// When false and the Substream drops without shutdown, emit ResetStream.
+    fin_delivered: std::sync::atomic::AtomicBool,
+
+    /// Whether we've already emitted a ResetStream in poll_next.
+    sent_reset: bool,
+
+    /// Shared state for network-level backpressure.
+    backpressure: Arc<Mutex<BackpressureState>>,
+
+    /// Pending message that couldn't be written due to backpressure.
+    pending_write: Option<Event>,
 }
 
 impl SubstreamHandle {
@@ -171,12 +204,28 @@ impl SubstreamHandle {
         // This ensures that if a FIN message contains data, we deliver it before closing.
         if let Some(payload) = message.payload {
             if !payload.is_empty() {
-                self.inbound_tx
+                tracing::trace!(
+                    target: "litep2p::webrtc::substream",
+                    payload_len = payload.len(),
+                    "forwarding payload to substream",
+                );
+                if self
+                    .inbound_tx
                     .send(Event::Message {
                         payload,
                         flag: None,
                     })
-                    .await?;
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!(
+                        target: "litep2p::webrtc::substream",
+                        "substream dropped, cannot deliver inbound payload",
+                    );
+                    // Don't return error — outbound data may still need to be flushed.
+                    // The SubstreamHandle will detect the drop via inbound_tx.is_closed()
+                    // in poll_next() and clean up naturally.
+                }
             }
         }
 
@@ -194,8 +243,18 @@ impl SubstreamHandle {
                         return Ok(());
                     }
 
-                    // Received FIN from remote, close our read half
-                    self.inbound_tx.send(Event::RecvClosed).await?;
+                    // Notify the Substream that the remote closed its write half.
+                    // If the Substream is already dropped, this is expected for
+                    // request-response protocols where the handler writes the response
+                    // and drops before the FIN arrives. Fall through to still send FIN_ACK.
+                    if self.inbound_tx.send(Event::RecvClosed).await.is_err() {
+                        tracing::debug!(
+                            target: "litep2p::webrtc::substream",
+                            "substream already dropped, skipping RecvClosed notification",
+                        );
+                    } else {
+                        self.fin_delivered.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
 
                     // Send FIN_ACK back to remote using try_send to avoid blocking.
                     // If the channel is full, the remote will timeout waiting for FIN_ACK
@@ -251,13 +310,47 @@ impl SubstreamHandle {
 
         Ok(())
     }
+
+    /// Set backpressure state and wake blocked writers if clearing.
+    pub fn set_backpressure(&mut self, backpressured: bool) {
+        let mut state = self.backpressure.lock();
+        let was_backpressured = state.active;
+        state.active = backpressured;
+
+        // If clearing backpressure, wake any blocked writers
+        if was_backpressured && !backpressured {
+            if let Some(waker) = state.waker.take() {
+                waker.wake();
+            }
+        }
+    }
+
+    /// Store a message that couldn't be written due to backpressure.
+    pub fn queue_pending(&mut self, event: Event) {
+        self.pending_write = Some(event);
+    }
+
+    /// Take any pending message for retry.
+    pub fn take_pending(&mut self) -> Option<Event> {
+        self.pending_write.take()
+    }
 }
 
 impl Stream for SubstreamHandle {
     type Item = Event;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        // First, try to drain any pending outbound messages
+        // Check backpressure before draining the queue to avoid overwriting
+        // the single pending_write slot when on_outbound_data returns Ok(true).
+        {
+            let mut state = self.backpressure.lock();
+            if state.active {
+                state.waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+        }
+
+        // Try to drain any pending outbound messages
         match self.rx.poll_recv(cx) {
             Poll::Ready(Some(event)) => return Poll::Ready(Some(event)),
             Poll::Ready(None) => {
@@ -270,10 +363,22 @@ impl Stream for SubstreamHandle {
         }
 
         // Check if Substream has been dropped (inbound channel closed)
-        // When Substream is dropped, there will be no more outbound messages
-        // Since we've already tried to recv above and got Pending, we know the queue is empty
-        // Therefore, it's safe to signal closure
+        // When Substream is dropped, there will be no more outbound messages.
+        // Since we've already tried to recv above and got Pending, we know the queue is empty.
         if self.inbound_tx.is_closed() {
+            // If the Substream was dropped without graceful shutdown AND the remote's
+            // FIN was never delivered (substream dropped before FIN arrived), emit
+            // ResetStream to tell the remote that this side closed unexpectedly.
+            if !self.sent_reset && !self.fin_delivered.load(std::sync::atomic::Ordering::SeqCst) {
+                let state = *self.state.lock();
+                if !matches!(state, State::FinSent | State::FinAcked) {
+                    self.sent_reset = true;
+                    return Poll::Ready(Some(Event::Message {
+                        payload: vec![],
+                        flag: Some(Flag::ResetStream),
+                    }));
+                }
+            }
             return Poll::Ready(None);
         }
 
@@ -336,6 +441,15 @@ impl tokio::io::AsyncWrite for Substream {
                 return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
             }
             State::Open => {}
+        }
+
+        // Check network backpressure before internal channel check
+        {
+            let mut state = self.backpressure.lock();
+            if state.active {
+                state.waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
         }
 
         match futures::ready!(self.tx.poll_reserve(cx)) {
@@ -1506,5 +1620,145 @@ mod tests {
             }
             other => panic!("Expected BrokenPipe error, got: {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn fin_after_handler_drop_preserves_response() {
+        // Regression test for the race condition where a FIN arrives after the
+        // request-response handler has written its response and dropped the Substream.
+        // Previously, this caused EssentialTaskClosed which killed the data channel
+        // before the buffered response could be flushed, causing silent response loss.
+
+        let (mut substream, mut handle) = Substream::new();
+
+        // Handler writes response data, then drops the Substream (simulates a
+        // request-response handler that's done processing).
+        substream.write_all(b"response data").await.unwrap();
+        drop(substream);
+
+        // Remote peer sends FIN (half-close: "I'm done sending my request").
+        // This must succeed even though the Substream is already dropped.
+        handle
+            .on_message(WebRtcMessage {
+                payload: None,
+                flag: Some(Flag::Fin),
+            })
+            .await
+            .unwrap();
+
+        // Drain the handle — response data must still be available.
+        // 1. Response data written by the handler
+        assert_eq!(
+            handle.next().await,
+            Some(Event::Message {
+                payload: b"response data".to_vec(),
+                flag: None,
+            })
+        );
+
+        // 2. FIN_ACK sent in response to the remote's FIN
+        assert_eq!(
+            handle.next().await,
+            Some(Event::Message {
+                payload: vec![],
+                flag: Some(Flag::FinAck),
+            })
+        );
+
+        // 3. RESET_STREAM because Substream was dropped without graceful shutdown
+        assert_eq!(
+            handle.next().await,
+            Some(Event::Message {
+                payload: vec![],
+                flag: Some(Flag::ResetStream),
+            })
+        );
+
+        // 4. Stream terminates
+        assert_eq!(handle.next().await, None);
+    }
+
+    #[tokio::test]
+    async fn network_backpressure_blocks_writes() {
+        let (mut substream, handle) = Substream::new();
+
+        // Simulate network backpressure by setting the flag
+        handle.backpressure.lock().active = true;
+
+        // Write should return Pending
+        futures::future::poll_fn(
+            |cx| match Pin::new(&mut substream).poll_write(cx, &[0u8; 100]) {
+                Poll::Pending => Poll::Ready(()),
+                _ => panic!("expected Pending when backpressured"),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn network_backpressure_wake_on_clear() {
+        use tokio::time::{sleep, timeout, Duration};
+
+        let (mut substream, mut handle) = Substream::new();
+
+        // Set backpressure
+        handle.set_backpressure(true);
+
+        // Spawn write that will block
+        let write_task = tokio::spawn(async move {
+            substream.write_all(&[1u8; 100]).await.unwrap();
+        });
+
+        // Give writer time to block
+        sleep(Duration::from_millis(10)).await;
+        assert!(
+            !write_task.is_finished(),
+            "writer should be blocked by backpressure"
+        );
+
+        // Clear backpressure - should wake writer
+        handle.set_backpressure(false);
+
+        // Writer should complete
+        timeout(Duration::from_secs(1), write_task)
+            .await
+            .expect("write should complete after backpressure cleared")
+            .expect("write task should not panic");
+
+        // Verify the message was sent
+        assert_eq!(
+            handle.next().await,
+            Some(Event::Message {
+                payload: vec![1u8; 100],
+                flag: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_write_queue_and_take() {
+        let (_substream, mut handle) = Substream::new();
+
+        // Initially no pending write
+        assert!(handle.take_pending().is_none());
+
+        // Queue a pending write
+        handle.queue_pending(Event::Message {
+            payload: vec![1, 2, 3],
+            flag: None,
+        });
+
+        // Take the pending write
+        let pending = handle.take_pending();
+        assert_eq!(
+            pending,
+            Some(Event::Message {
+                payload: vec![1, 2, 3],
+                flag: None,
+            })
+        );
+
+        // Should be empty now
+        assert!(handle.take_pending().is_none());
     }
 }
